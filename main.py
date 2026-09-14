@@ -16,9 +16,9 @@ import chromadb
 import ollama
 import pdfplumber
 
-PDF_PATH = "loan_statement.pdf"  # change to your file
+PDF_PATH = "loanStatement.pdf"  # change to your file
 EMBED_MODEL = "nomic-embed-text"
-CHAT_MODEL = "llama3.1"
+CHAT_MODEL = "llama3.1:8b"
 COLLECTION_NAME = "loan_statement"
 
 
@@ -98,7 +98,11 @@ def build_chunks(text_chunks, table_rows):
 # ---------------------------------------------------------------------------
 def index_chunks(chunks):
     client = chromadb.PersistentClient(path="./chroma_db")
-    collection = client.get_or_create_collection(COLLECTION_NAME)
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    collection = client.create_collection(COLLECTION_NAME)
 
     for i, chunk in enumerate(chunks):
         embedding = ollama.embeddings(model=EMBED_MODEL, prompt=chunk["text"])[
@@ -116,15 +120,21 @@ def index_chunks(chunks):
 # ---------------------------------------------------------------------------
 # STEP 5: Retrieve + generate
 # ---------------------------------------------------------------------------
-def answer_question(collection, question, top_k=5):
+def answer_question(collection, question, top_k=10):
     q_embedding = ollama.embeddings(model=EMBED_MODEL, prompt=question)["embedding"]
     results = collection.query(query_embeddings=[q_embedding], n_results=top_k)
-    retrieved = results["documents"][0]
+    retrieved = list(results["documents"][0])
 
-    context = "\n".join(retrieved)
-    prompt = f"""Answer the question using ONLY the context below.
-If the answer isn't in the context, say you don't have that information.
-Quote the exact numbers/dates you used.
+    summary_chunks = collection.get(where={"type": "summary_text"})
+    existing = set(retrieved)
+    for doc in summary_chunks["documents"]:
+        if doc not in existing:
+            retrieved.append(doc)
+
+    context = "\n\n".join(retrieved)
+    prompt = f"""You are a helpful assistant. Answer the question based on the context below.
+If the context contains relevant information, use it to answer.
+If the context truly does not contain the answer, say so.
 
 Context:
 {context}
