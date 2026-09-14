@@ -1,25 +1,36 @@
 """
-Simple local RAG chatbot for structured/tabular PDFs (e.g. bank loan statements).
+RAG chatbot for structured/tabular PDFs (e.g. bank loan statements).
 
-Stack (all local, no API keys):
-  - pdfplumber   -> pulls tables out as real rows/columns, not flat text
-  - Ollama       -> local embedding model + local LLM
-  - Chroma       -> local vector store (just a folder on disk)
+Stack:
+  - pdfplumber          -> pulls tables out as real rows/columns, not flat text
+  - Groq                -> fast hosted LLM for answering (needs GROQ_API_KEY in .env)
+  - Chroma              -> local vector store (just a folder on disk, embeddings run in-process)
 
-Setup (run once in your terminal, not in this script):
-  ollama pull nomic-embed-text      # embedding model
-  ollama pull llama3.1              # or qwen2.5, mistral, whatever you have pulled
-  pip install pdfplumber chromadb ollama
+Setup:
+  1. Put your key in .env:  GROQ_API_KEY=your_key_here
+  2. pip install pdfplumber chromadb groq python-dotenv
 """
 
+import os
+
 import chromadb
-import ollama
 import pdfplumber
+from dotenv import load_dotenv
+from groq import Groq
+
+load_dotenv()
 
 PDF_PATH = "loanStatement.pdf"  # change to your file
-EMBED_MODEL = "nomic-embed-text"
-CHAT_MODEL = "llama3.1:8b"
+CHAT_MODEL = "llama-3.1-8b-instant"
 COLLECTION_NAME = "loan_statement"
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise SystemExit("GROQ_API_KEY not found in .env")
+
+
+def get_llm():
+    return Groq(api_key=GROQ_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +105,7 @@ def build_chunks(text_chunks, table_rows):
 
 
 # ---------------------------------------------------------------------------
-# STEP 4: Embed with Ollama's local embedding model and store in Chroma
+# STEP 4: Store chunks in Chroma (default embedder runs locally, in-process)
 # ---------------------------------------------------------------------------
 def index_chunks(chunks):
     client = chromadb.PersistentClient(path="./chroma_db")
@@ -102,15 +113,13 @@ def index_chunks(chunks):
         client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
+    # no embedding_function passed -> Chroma uses its built-in default
+    # (all-MiniLM-L6-v2 via onnxruntime), so no external embedding service.
     collection = client.create_collection(COLLECTION_NAME)
 
     for i, chunk in enumerate(chunks):
-        embedding = ollama.embeddings(model=EMBED_MODEL, prompt=chunk["text"])[
-            "embedding"
-        ]
         collection.add(
             ids=[str(i)],
-            embeddings=[embedding],
             documents=[chunk["text"]],
             metadatas=[chunk["metadata"]],
         )
@@ -121,8 +130,7 @@ def index_chunks(chunks):
 # STEP 5: Retrieve + generate
 # ---------------------------------------------------------------------------
 def answer_question(collection, question, top_k=10):
-    q_embedding = ollama.embeddings(model=EMBED_MODEL, prompt=question)["embedding"]
-    results = collection.query(query_embeddings=[q_embedding], n_results=top_k)
+    results = collection.query(query_texts=[question], n_results=top_k)
     retrieved = list(results["documents"][0])
 
     summary_chunks = collection.get(where={"type": "summary_text"})
@@ -142,11 +150,13 @@ Context:
 Question: {question}
 Answer:"""
 
-    response = ollama.chat(
+    client = get_llm()
+    response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
     )
-    return response["message"]["content"], retrieved
+    return response.choices[0].message.content, retrieved
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +170,7 @@ if __name__ == "__main__":
     print("Building chunks...")
     chunks = build_chunks(text_chunks, table_rows)
 
-    print("Embedding + indexing (this calls Ollama once per chunk)...")
+    print("Indexing chunks into Chroma (local embeddings)...")
     collection = index_chunks(chunks)
 
     print("\nReady. Ask questions (type 'exit' to quit).\n")
