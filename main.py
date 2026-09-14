@@ -1,16 +1,3 @@
-"""
-RAG chatbot for structured/tabular PDFs (e.g. bank loan statements).
-
-Stack:
-  - pdfplumber          -> pulls tables out as real rows/columns, not flat text
-  - Groq                -> fast hosted LLM for answering (needs GROQ_API_KEY in .env)
-  - Chroma              -> local vector store (just a folder on disk, embeddings run in-process)
-
-Setup:
-  1. Put your key in .env:  GROQ_API_KEY=your_key_here
-  2. pip install pdfplumber chromadb groq python-dotenv
-"""
-
 import os
 
 import chromadb
@@ -20,9 +7,10 @@ from groq import Groq
 
 load_dotenv()
 
-PDF_PATH = "loanStatement.pdf"  # change to your file
-CHAT_MODEL = "llama-3.1-8b-instant"
+CHAT_MODEL = "openai/gpt-oss-20b"
 COLLECTION_NAME = "loan_statement"
+MAX_OUTPUT_TOKENS = 512
+CONTEXT_BUDGET_CHARS = 40000
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
@@ -33,54 +21,51 @@ def get_llm():
     return Groq(api_key=GROQ_API_KEY)
 
 
-# ---------------------------------------------------------------------------
-# STEP 1: Extract text + tables SEPARATELY
-# ---------------------------------------------------------------------------
-# The whole trick for tabular PDFs: don't let pdfplumber's plain .extract_text()
-# flatten a table into a wall of numbers. Pull tables with .extract_tables()
-# so you keep the row/column structure, and only use extract_text() for the
-# surrounding narrative text (headers, notes, etc).
 def extract_pdf(path):
     text_chunks = []
-    table_rows = []  # list of dicts: {page, header, row}
+    table_rows = []
 
-    with pdfplumber.open(path) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            tables = page.extract_tables()
+    pdf = pdfplumber.open(path)
 
-            # keep the header row of each table so every chunk can carry it
-            for table in tables:
-                if not table or len(table) < 2:
-                    continue
-                header = table[0]
-                for row in table[1:]:
-                    table_rows.append({"page": page_num, "header": header, "row": row})
+    for page_num, page in enumerate(pdf.pages, start=1):
+        tables = page.find_tables()
 
-            # grab non-table text too (loan summary fields etc. that aren't
-            # inside a detected table)
-            page_text = page.extract_text() or ""
-            text_chunks.append({"page": page_num, "text": page_text})
+        for table in tables:
+            grid = table.extract()
+
+            if len(grid) < 2:
+                continue
+
+            header = grid[0]
+
+            for row in grid[1:]:
+                table_rows.append({"page": page_num, "header": header, "row": row})
+
+            # for row_1_detection in grid[1::]:
+            #     table_rows.append({ page_num,  header,  row})
+
+        x0, top, x1, bottom = page.bbox
+
+        if tables:
+            above = page.crop((x0, top, x1, tables[0].bbox[1])).extract_text() or ""
+
+            below = page.crop((x0, tables[-1].bbox[3], x1, bottom)).extract_text() or ""
+
+            text = " ".join(t for t in (above.strip(), below.strip()) if t)
+        else:
+            text = page.extract_text() or ""
+
+        if text:
+            text_chunks.append({"page": page_num, "text": text})
 
     return text_chunks, table_rows
 
 
-# ---------------------------------------------------------------------------
-# STEP 2: Turn each table row into a markdown-style sentence with headers attached
-# ---------------------------------------------------------------------------
-# This is the part that actually matters. A raw row like
-#   ['07/06/2025', 'Payment Received', '07/06/2025', 'S116456321/1-52', '13,434.00 CR', '0.00 DR']
-# means nothing to an embedding model on its own. Pairing it with the header
-# turns it into something the model (and the LLM later) can actually read.
 def row_to_text(header, row):
     pairs = [f"{h.strip()}: {v.strip()}" for h, v in zip(header, row) if h and v]
     return "Transaction — " + ", ".join(pairs)
 
 
-# ---------------------------------------------------------------------------
-# STEP 3: Chunk by logical unit (here: one chunk per row, since each row is
-# already a complete, self-contained fact). For plain narrative text, you'd
-# chunk by paragraph or section instead.
-# ---------------------------------------------------------------------------
 def build_chunks(text_chunks, table_rows):
     chunks = []
 
@@ -104,17 +89,13 @@ def build_chunks(text_chunks, table_rows):
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# STEP 4: Store chunks in Chroma (default embedder runs locally, in-process)
-# ---------------------------------------------------------------------------
 def index_chunks(chunks):
     client = chromadb.PersistentClient(path="./chroma_db")
     try:
         client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
-    # no embedding_function passed -> Chroma uses its built-in default
-    # (all-MiniLM-L6-v2 via onnxruntime), so no external embedding service.
+
     collection = client.create_collection(COLLECTION_NAME)
 
     for i, chunk in enumerate(chunks):
@@ -126,10 +107,7 @@ def index_chunks(chunks):
     return collection
 
 
-# ---------------------------------------------------------------------------
-# STEP 5: Retrieve + generate
-# ---------------------------------------------------------------------------
-def answer_question(collection, question, top_k=10):
+def retrieve_context(collection, question, top_k=10):
     results = collection.query(query_texts=[question], n_results=top_k)
     retrieved = list(results["documents"][0])
 
@@ -139,44 +117,43 @@ def answer_question(collection, question, top_k=10):
         if doc not in existing:
             retrieved.append(doc)
 
-    context = "\n\n".join(retrieved)
-    prompt = f"""You are a helpful assistant. Answer the question based on the context below.
-If the context contains relevant information, use it to answer.
-If the context truly does not contain the answer, say so.
+    context = ""
+    for doc in retrieved:
+        if len(context) + len(doc) > CONTEXT_BUDGET_CHARS:
+            break
+        context += "\n\n" + doc if context else doc
+    return context
+
+
+def build_prompt(question, context):
+    return f"""You are a friendly, human bank customer-support agent. Respond ONLY using the facts in the context below.
+
+Rules:
+- Write like a real person talking to a customer: warm, natural, complete sentences, no labels or bullet points.
+- Use the facts exactly as they appear; don't invent or merge separate fields.
+- If the fact isn't in the context, say you don't have that information.
+- Keep it short (1-3 sentences) unless the question needs more.
 
 Context:
 {context}
 
 Question: {question}
-Answer:"""
+Customer service agent:"""
+
+
+def stream_answer_question(collection, question, top_k=10):
+    """Yield the answer token-by-token as Groq generates it (SSE-ready)."""
+    context = retrieve_context(collection, question, top_k)
+    prompt = build_prompt(question, context)
 
     client = get_llm()
-    response = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
+        temperature=0.4,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        stream=True,
     )
-    return response.choices[0].message.content, retrieved
-
-
-# ---------------------------------------------------------------------------
-# Run it
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("Extracting PDF...")
-    text_chunks, table_rows = extract_pdf(PDF_PATH)
-    print(f"Found {len(table_rows)} table rows and {len(text_chunks)} text blocks")
-
-    print("Building chunks...")
-    chunks = build_chunks(text_chunks, table_rows)
-
-    print("Indexing chunks into Chroma (local embeddings)...")
-    collection = index_chunks(chunks)
-
-    print("\nReady. Ask questions (type 'exit' to quit).\n")
-    while True:
-        q = input("You: ")
-        if q.strip().lower() == "exit":
-            break
-        answer, sources = answer_question(collection, q)
-        print(f"\nBot: {answer}\n")
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content

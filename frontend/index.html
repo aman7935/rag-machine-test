@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bank Statement Chatbot</title>
+  <link rel="stylesheet" href="style.css?v=2" />
+</head>
+<body>
+  <div id="app">
+    <header id="top">
+      <h1>Bank Statement Chatbot</h1>
+      <p>Upload a statement, then ask questions about it.</p>
+    </header>
+
+    <section id="panel">
+      <div id="upload-card" class="card">
+        <h2>1 · Upload statement</h2>
+        <div class="row">
+          <input type="file" id="file" accept=".pdf" />
+          <button id="up">Upload</button>
+        </div>
+        <span id="st"></span>
+      </div>
+
+      <div id="chat-card" class="card hidden">
+        <div id="chat-head">
+          <h2 id="chat-title">Chat</h2>
+          <span id="file-info"></span>
+        </div>
+        <div id="msgs"></div>
+        <form id="f">
+          <input id="q" placeholder="Ask about the statement..." autocomplete="off" />
+          <button>Ask</button>
+        </form>
+      </div>
+    </section>
+  </div>
+
+  <script src="script.js?v=2"></script>
+</body>
+</html>
