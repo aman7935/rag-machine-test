@@ -1,6 +1,6 @@
-import asyncio
 import json
-from io import BytesIO
+import os
+import tempfile
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,6 @@ from pydantic import BaseModel
 from main import build_chunks, extract_pdf, index_chunks, stream_answer_question
 
 app = FastAPI()
-STREAM_DELAY = 0.03
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +38,19 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="only pdf are acepted")
 
     data = await file.read()
-    text_chunks, table_rows = extract_pdf(BytesIO(data))
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        text_chunks, table_rows = extract_pdf(tmp_path)
+
+        print("chunks and rows done =-=-======--=-=-==-=-=-->>   ", table_rows)
+
+        print("chunks and rows done =-=-======--=-=-==-=-=-->>   ", text_chunks)
+
+    finally:
+        os.remove(tmp_path)
     chunks = build_chunks(text_chunks, table_rows)
     collection = index_chunks(chunks)
     # filename = file.filename
@@ -54,16 +65,14 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.post("/ask")
 def ask(req: AskRequest):
-    if collection is None:
-        raise HTTPException(status_code=400, detail="upload the pdf first")
+
+    # if collection is None:
+    #   raise HTTPException()
 
     async def stream():
-        try:
-            for token in stream_answer_question(collection, req.question):
-                yield f"data: {json.dumps({'token': token})}\n\n"
-                await asyncio.sleep(STREAM_DELAY)
-            yield "data: [DONE]\n\n"
-        except Exception as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        for token in stream_answer_question(collection, req.question):
+            yield f"data: {json.dumps({'token': token})}\n\n"
+            # await asyncio.sleep(0.03)
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
